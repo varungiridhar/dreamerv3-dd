@@ -35,6 +35,28 @@ class RSSM(nj.Module):
 
   def __init__(self, **kw):
     self.kw = kw
+    self.group_seperate = {
+			'hopper': {
+				'ED2': [[0, 1], [2], [3]],
+			},
+			'finger': {
+				'ED2': [[0], [1]],
+			},
+			'cheetah': {
+				'ED2': [[2], [5], [3, 4], [0, 1]],
+			},
+			'walker': {
+				'ED2': [[0, 1, 3, 4], [2], [5]],
+			},
+			'reacher': {
+				'ED2': [[0], [1]],
+				},
+			'humanoid': {
+				'ED2': [[7], [13], [2, 3, 9], [0, 5, 11], [6, 8], [12, 14], [18, 15, 17, 20, 16, 1, 19], [4, 10]],
+			},
+		}
+    self.action_group = self.group_seperate['walker']['ED2']
+    self.action_group_num = len(self.action_group)
 
   def initial(self, bsize):
     carry = dict(
@@ -62,7 +84,23 @@ class RSSM(nj.Module):
           carry, (action, embed, reset), self.unroll, axis=1)
     deter, stoch, action = jaxutils.reset(
         (carry['deter'], carry['stoch'], action), reset)
-    deter, feat = self._gru(deter, stoch, action)
+    # deter, feat = self._gru_1(deter, stoch, action)
+    action_split = jnp.split(action, action.shape[-1], axis=-1)
+
+    sum_deter = []
+    sum_feat = []
+    for i in range(self.action_group_num):
+      ed2_action_group = self.action_group[i]
+      action_tensor = jnp.concatenate([action_split[j] for j in ed2_action_group], axis=-1)
+      deter, feat = getattr(self, f'_gru_{i+1}')(deter, stoch, action_tensor)
+      # append the deter and feat to the list
+      sum_deter.append(deter)
+      sum_feat.append(feat)
+    
+    # reduce to mean
+    deter = jnp.mean(jnp.stack(sum_deter), axis=0)
+    feat = jnp.mean(jnp.stack(sum_feat), axis=0)
+
     x = embed if self.absolute else jnp.concatenate([feat, embed], -1)
     for i in range(self.obslayers):
       x = self.get(f'obs{i}', Linear, self.hidden, **kw)(x)
@@ -75,16 +113,35 @@ class RSSM(nj.Module):
       outs['feat'] = feat
     return cast(carry), cast(outs)
 
-  def imagine(self, carry, action, bdims=2):
+  def imagine(self, carry, action, bdims=2): # carry = prev_state
     assert bdims in (1, 2)
     if isinstance(action, dict):
-      action = jaxutils.concat_dict(action)
+      action = jaxutils.concat_dict(action) # convert from dict to array
     carry, action = cast((carry, action))
     if bdims == 2:
       return jaxutils.scan(
           lambda carry, action: self.imagine(carry, action, bdims=1),
           cast(carry), cast(action), self.unroll, axis=1)
-    deter, feat = self._gru(carry['deter'], carry['stoch'], action)
+    # deter, feat = self._gru(carry['deter'], carry['stoch'], action)
+    action_split = jnp.split(action, action.shape[-1], axis=-1)
+    print("action_split: ", action_split)
+    # TODO: check action split is correct
+    sum_deter = []
+    sum_feat = []
+    for i in range(self.action_group_num):
+      ed2_action_group = self.action_group[i]
+      action_tensor = jnp.concatenate([action_split[j] for j in ed2_action_group], axis=-1)
+      print("action_tensor: ", action_tensor, "associated with action group: ", ed2_action_group)
+      # TODO: check action tensor shape
+      deter, feat = getattr(self, f'_gru_{i+1}')(carry['deter'], carry['stoch'], action_tensor)
+      # append the deter and feat to the list
+      sum_deter.append(deter)
+      sum_feat.append(feat)
+
+    # reduce to mean
+    deter = jnp.mean(jnp.stack(sum_deter), axis=0)
+    feat = jnp.mean(jnp.stack(sum_feat), axis=0)
+
     logit = self._prior(feat)
     stoch = cast(self._dist(logit).sample(seed=nj.seed()))
     carry = dict(deter=deter, stoch=stoch)
@@ -116,94 +173,252 @@ class RSSM(nj.Module):
       x = self.get(f'img{i}', Linear, self.hidden, **kw)(x)
     return self._logit('imglogit', x)
 
-  def _gru(self, deter, stoch, action):
+  def _gru_1(self, deter, stoch, action):
     kw = dict(**self.kw, norm=self.norm, act=self.act)
     inkw = {**self.kw, 'norm': self.norm, 'binit': False}
     stoch = stoch.reshape((stoch.shape[0], -1))
     action /= sg(jnp.maximum(1, jnp.abs(action)))
-    if self.cell == 'gru':
-      x0 = self.get('dynnorm', Norm, self.norm)(deter)
-      x1 = self.get('dynin1', Linear, self.hidden, **inkw)(stoch)
-      x2 = self.get('dynin2', Linear, self.hidden, **inkw)(action)
-      x = jnp.concatenate([x0, x1, x2], -1)
-      for i in range(self.dynlayers):
-        x = self.get(f'dyn{i}', Linear, self.hidden, **kw)(x)
-      x = self.get('dyncore', Linear, 3 * self.deter, **self.kw)(x)
-      reset, cand, update = jnp.split(x, 3, -1)
-      reset = jax.nn.sigmoid(reset)
-      cand = jnp.tanh(reset * cand)
-      update = jax.nn.sigmoid(update - 1)
-      deter = update * cand + (1 - update) * deter
-      out = deter
-    elif self.cell == 'mgu':
-      x0 = self.get('dynnorm', Norm, self.norm)(deter)
-      x1 = self.get('dynin1', Linear, self.hidden, **inkw)(stoch)
-      x2 = self.get('dynin2', Linear, self.hidden, **inkw)(action)
-      x = jnp.concatenate([x0, x1, x2], -1)
-      for i in range(self.dynlayers):
-        x = self.get(f'dyn{i}', Linear, self.hidden, **kw)(x)
-      x = self.get('dyncore', Linear, 2 * self.deter, **self.kw)(x)
-      cand, update = jnp.split(x, 2, -1)
-      update = jax.nn.sigmoid(update - 1)
-      cand = jnp.tanh((1 - update) * cand)
-      deter = update * cand + (1 - update) * deter
-      out = deter
-    elif self.cell == 'blockgru':
-      g = self.blocks
-      flat2group = lambda x: einops.rearrange(x, '... (g h) -> ... g h', g=g)
-      group2flat = lambda x: einops.rearrange(x, '... g h -> ... (g h)', g=g)
-      x0 = self.get('dynin0', Linear, self.hidden, **kw)(deter)
-      x1 = self.get('dynin1', Linear, self.hidden, **kw)(stoch)
-      x2 = self.get('dynin2', Linear, self.hidden, **kw)(action)
-      x = jnp.concatenate([x0, x1, x2], -1)[..., None, :].repeat(g, -2)
-      x = group2flat(jnp.concatenate([flat2group(deter), x], -1))
-      for i in range(self.dynlayers):
-        x = self.get(
-            f'dyn{i}', BlockLinear, self.deter, g, **kw,
-            block_norm=self.block_norm, block_fans=self.block_fans)(x)
+    g = self.blocks
+    flat2group = lambda x: einops.rearrange(x, '... (g h) -> ... g h', g=g)
+    group2flat = lambda x: einops.rearrange(x, '... g h -> ... (g h)', g=g)
+    x0 = self.get('dynin0_1', Linear, self.hidden, **kw)(deter)
+    x1 = self.get('dynin1_1', Linear, self.hidden, **kw)(stoch)
+    x2 = self.get('dynin2_1', Linear, self.hidden, **kw)(action) # ideally we want this to dynamically change based on the passed on action groups. 
+    x = jnp.concatenate([x0, x1, x2], -1)[..., None, :].repeat(g, -2)
+    x = group2flat(jnp.concatenate([flat2group(deter), x], -1))
+    for i in range(self.dynlayers):
       x = self.get(
-          'dyncore', BlockLinear, 3 * self.deter, g, **self.kw,
-          block_fans=self.block_fans)(x)
-      gates = jnp.split(flat2group(x), 3, -1)
-      reset, cand, update = [group2flat(x) for x in gates]
-      reset = jax.nn.sigmoid(reset)
-      cand = jnp.tanh(reset * cand)
-      update = jax.nn.sigmoid(update - 1)
-      deter = update * cand + (1 - update) * deter
-      out = deter
-    elif self.cell == 'stack':
-      result = []
-      deters = jnp.split(deter, self.dynlayers, -1)
-      x = jnp.concatenate([stoch, action], -1)
-      x = self.get('in', Linear, self.hidden, **kw)(x)
-      for i in range(self.dynlayers):
-        skip = x
-        x = get_act(self.act)(jnp.concatenate([
-            self.get(f'dyngru{i}norm1', Norm, self.norm)(deters[i]),
-            self.get(f'dyngru{i}norm2', Norm, self.norm)(x)], -1))
-        x = self.get(
-            f'dyngru{i}core', Linear, 3 * deters[i].shape[-1], **self.kw)(x)
-        reset, cand, update = jnp.split(x, 3, -1)
-        reset = jax.nn.sigmoid(reset)
-        cand = jnp.tanh(reset * cand)
-        update = jax.nn.sigmoid(update - 1)
-        deter = update * cand + (1 - update) * deters[i]
-        result.append(deter)
-        x = self.get(f'dyngru{i}proj', Linear, self.hidden, **self.kw)(x)
-        x += skip
-        skip = x
-        x = self.get(f'dynmlp{i}norm', Norm, self.norm)(x)
-        x = self.get(
-            f'dynmlp{i}up', Linear, deters[i].shape[-1], **self.kw)(x)
-        x = get_act(self.act)(x)
-        x = self.get(f'dynmlp{i}down', Linear, self.hidden, **self.kw)(x)
-        x += skip
-      out = self.get('outnorm', Norm, self.norm)(x)
-      deter = jnp.concatenate(result, -1)
-    else:
-      raise NotImplementedError(self.cell)
+          f'dyn{i}_1', BlockLinear, self.deter, g, **kw,
+          block_norm=self.block_norm, block_fans=self.block_fans)(x)
+    x = self.get(
+        'dyncore_1', BlockLinear, 3 * self.deter, g, **self.kw,
+        block_fans=self.block_fans)(x)
+    gates = jnp.split(flat2group(x), 3, -1)
+    reset, cand, update = [group2flat(x) for x in gates]
+    reset = jax.nn.sigmoid(reset)
+    cand = jnp.tanh(reset * cand)
+    update = jax.nn.sigmoid(update - 1)
+    deter = update * cand + (1 - update) * deter
+    out = deter
+  
+    return deter, out
+  
+  def _gru_2(self, deter, stoch, action):
+    kw = dict(**self.kw, norm=self.norm, act=self.act)
+    inkw = {**self.kw, 'norm': self.norm, 'binit': False}
+    stoch = stoch.reshape((stoch.shape[0], -1))
+    action /= sg(jnp.maximum(1, jnp.abs(action)))
+    g = self.blocks
+    flat2group = lambda x: einops.rearrange(x, '... (g h) -> ... g h', g=g)
+    group2flat = lambda x: einops.rearrange(x, '... g h -> ... (g h)', g=g)
+    x0 = self.get('dynin0_2', Linear, self.hidden, **kw)(deter)
+    x1 = self.get('dynin1_2', Linear, self.hidden, **kw)(stoch)
+    x2 = self.get('dynin2_2', Linear, self.hidden, **kw)(action) # ideally we want this to dynamically change based on the passed on action groups. 
+    x = jnp.concatenate([x0, x1, x2], -1)[..., None, :].repeat(g, -2)
+    x = group2flat(jnp.concatenate([flat2group(deter), x], -1))
+    for i in range(self.dynlayers):
+      x = self.get(
+          f'dyn{i}_2', BlockLinear, self.deter, g, **kw,
+          block_norm=self.block_norm, block_fans=self.block_fans)(x)
+    x = self.get(
+        'dyncore_2', BlockLinear, 3 * self.deter, g, **self.kw,
+        block_fans=self.block_fans)(x)
+    gates = jnp.split(flat2group(x), 3, -1)
+    reset, cand, update = [group2flat(x) for x in gates]
+    reset = jax.nn.sigmoid(reset)
+    cand = jnp.tanh(reset * cand)
+    update = jax.nn.sigmoid(update - 1)
+    deter = update * cand + (1 - update) * deter
+    out = deter
+  
     return deter, out
 
+  def _gru_3(self, deter, stoch, action):
+    kw = dict(**self.kw, norm=self.norm, act=self.act)
+    inkw = {**self.kw, 'norm': self.norm, 'binit': False}
+    stoch = stoch.reshape((stoch.shape[0], -1))
+    action /= sg(jnp.maximum(1, jnp.abs(action)))
+    g = self.blocks
+    flat2group = lambda x: einops.rearrange(x, '... (g h) -> ... g h', g=g)
+    group2flat = lambda x: einops.rearrange(x, '... g h -> ... (g h)', g=g)
+    x0 = self.get('dynin0_3', Linear, self.hidden, **kw)(deter)
+    x1 = self.get('dynin1_3', Linear, self.hidden, **kw)(stoch)
+    # print all the kw values
+    x2 = self.get('dynin2_3', Linear, self.hidden, **kw)(action) # ideally we want this to dynamically change based on the passed on action groups. 
+    x = jnp.concatenate([x0, x1, x2], -1)[..., None, :].repeat(g, -2)
+    x = group2flat(jnp.concatenate([flat2group(deter), x], -1))
+    for i in range(self.dynlayers):
+      x = self.get(
+          f'dyn{i}_3', BlockLinear, self.deter, g, **kw,
+          block_norm=self.block_norm, block_fans=self.block_fans)(x)
+    x = self.get(
+        'dyncore_3', BlockLinear, 3 * self.deter, g, **self.kw,
+        block_fans=self.block_fans)(x)
+    gates = jnp.split(flat2group(x), 3, -1)
+    reset, cand, update = [group2flat(x) for x in gates]
+    reset = jax.nn.sigmoid(reset)
+    cand = jnp.tanh(reset * cand)
+    update = jax.nn.sigmoid(update - 1)
+    deter = update * cand + (1 - update) * deter
+    out = deter
+  
+    return deter, out
+
+  def _gru_4(self, deter, stoch, action):
+    kw = dict(**self.kw, norm=self.norm, act=self.act)
+    inkw = {**self.kw, 'norm': self.norm, 'binit': False}
+    stoch = stoch.reshape((stoch.shape[0], -1))
+    action /= sg(jnp.maximum(1, jnp.abs(action)))
+    g = self.blocks
+    flat2group = lambda x: einops.rearrange(x, '... (g h) -> ... g h', g=g)
+    group2flat = lambda x: einops.rearrange(x, '... g h -> ... (g h)', g=g)
+    x0 = self.get('dynin0_4', Linear, self.hidden, **kw)(deter)
+    x1 = self.get('dynin1_4', Linear, self.hidden, **kw)(stoch)
+    # print all the kw values
+    x2 = self.get('dynin2_4', Linear, self.hidden, **kw)(action) # ideally we want this to dynamically change based on the passed on action groups. 
+    x = jnp.concatenate([x0, x1, x2], -1)[..., None, :].repeat(g, -2)
+    x = group2flat(jnp.concatenate([flat2group(deter), x], -1))
+    for i in range(self.dynlayers):
+      x = self.get(
+          f'dyn{i}_4', BlockLinear, self.deter, g, **kw,
+          block_norm=self.block_norm, block_fans=self.block_fans)(x)
+    x = self.get(
+        'dyncore_4', BlockLinear, 3 * self.deter, g, **self.kw,
+        block_fans=self.block_fans)(x)
+    gates = jnp.split(flat2group(x), 3, -1)
+    reset, cand, update = [group2flat(x) for x in gates]
+    reset = jax.nn.sigmoid(reset)
+    cand = jnp.tanh(reset * cand)
+    update = jax.nn.sigmoid(update - 1)
+    deter = update * cand + (1 - update) * deter
+    out = deter
+  
+    return deter, out
+  
+  def _gru_5(self, deter, stoch, action):
+    kw = dict(**self.kw, norm=self.norm, act=self.act)
+    inkw = {**self.kw, 'norm': self.norm, 'binit': False}
+    stoch = stoch.reshape((stoch.shape[0], -1))
+    action /= sg(jnp.maximum(1, jnp.abs(action)))
+    g = self.blocks
+    flat2group = lambda x: einops.rearrange(x, '... (g h) -> ... g h', g=g)
+    group2flat = lambda x: einops.rearrange(x, '... g h -> ... (g h)', g=g)
+    x0 = self.get('dynin0_5', Linear, self.hidden, **kw)(deter)
+    x1 = self.get('dynin1_5', Linear, self.hidden, **kw)(stoch)
+    # print all the kw values
+    x2 = self.get('dynin2_5', Linear, self.hidden, **kw)(action) # ideally we want this to dynamically change based on the passed on action groups. 
+    x = jnp.concatenate([x0, x1, x2], -1)[..., None, :].repeat(g, -2)
+    x = group2flat(jnp.concatenate([flat2group(deter), x], -1))
+    for i in range(self.dynlayers):
+      x = self.get(
+          f'dyn{i}_5', BlockLinear, self.deter, g, **kw,
+          block_norm=self.block_norm, block_fans=self.block_fans)(x)
+    x = self.get(
+        'dyncore_5', BlockLinear, 3 * self.deter, g, **self.kw,
+        block_fans=self.block_fans)(x)
+    gates = jnp.split(flat2group(x), 3, -1)
+    reset, cand, update = [group2flat(x) for x in gates]
+    reset = jax.nn.sigmoid(reset)
+    cand = jnp.tanh(reset * cand)
+    update = jax.nn.sigmoid(update - 1)
+    deter = update * cand + (1 - update) * deter
+    out = deter
+  
+    return deter, out
+  
+  def _gru_6(self, deter, stoch, action):
+    kw = dict(**self.kw, norm=self.norm, act=self.act)
+    inkw = {**self.kw, 'norm': self.norm, 'binit': False}
+    stoch = stoch.reshape((stoch.shape[0], -1))
+    action /= sg(jnp.maximum(1, jnp.abs(action)))
+    g = self.blocks
+    flat2group = lambda x: einops.rearrange(x, '... (g h) -> ... g h', g=g)
+    group2flat = lambda x: einops.rearrange(x, '... g h -> ... (g h)', g=g)
+    x0 = self.get('dynin0_6', Linear, self.hidden, **kw)(deter)
+    x1 = self.get('dynin1_6', Linear, self.hidden, **kw)(stoch)
+    # print all the kw values
+    x2 = self.get('dynin2_6', Linear, self.hidden, **kw)(action) # ideally we want this to dynamically change based on the passed on action groups. 
+    x = jnp.concatenate([x0, x1, x2], -1)[..., None, :].repeat(g, -2)
+    x = group2flat(jnp.concatenate([flat2group(deter), x], -1))
+    for i in range(self.dynlayers):
+      x = self.get(
+          f'dyn{i}_6', BlockLinear, self.deter, g, **kw,
+          block_norm=self.block_norm, block_fans=self.block_fans)(x)
+    x = self.get(
+        'dyncore_6', BlockLinear, 3 * self.deter, g, **self.kw,
+        block_fans=self.block_fans)(x)
+    gates = jnp.split(flat2group(x), 3, -1)
+    reset, cand, update = [group2flat(x) for x in gates]
+    reset = jax.nn.sigmoid(reset)
+    cand = jnp.tanh(reset * cand)
+    update = jax.nn.sigmoid(update - 1)
+    deter = update * cand + (1 - update) * deter
+    out = deter
+  
+    return deter, out
+  
+  def _gru_7(self, deter, stoch, action):
+    kw = dict(**self.kw, norm=self.norm, act=self.act)
+    inkw = {**self.kw, 'norm': self.norm, 'binit': False}
+    stoch = stoch.reshape((stoch.shape[0], -1))
+    action /= sg(jnp.maximum(1, jnp.abs(action)))
+    g = self.blocks
+    flat2group = lambda x: einops.rearrange(x, '... (g h) -> ... g h', g=g)
+    group2flat = lambda x: einops.rearrange(x, '... g h -> ... (g h)', g=g)
+    x0 = self.get('dynin0_7', Linear, self.hidden, **kw)(deter)
+    x1 = self.get('dynin1_7', Linear, self.hidden, **kw)(stoch)
+    # print all the kw values
+    x2 = self.get('dynin2_7', Linear, self.hidden, **kw)(action) # ideally we want this to dynamically change based on the passed on action groups. 
+    x = jnp.concatenate([x0, x1, x2], -1)[..., None, :].repeat(g, -2)
+    x = group2flat(jnp.concatenate([flat2group(deter), x], -1))
+    for i in range(self.dynlayers):
+      x = self.get(
+          f'dyn{i}_7', BlockLinear, self.deter, g, **kw,
+          block_norm=self.block_norm, block_fans=self.block_fans)(x)
+    x = self.get(
+        'dyncore_7', BlockLinear, 3 * self.deter, g, **self.kw,
+        block_fans=self.block_fans)(x)
+    gates = jnp.split(flat2group(x), 3, -1)
+    reset, cand, update = [group2flat(x) for x in gates]
+    reset = jax.nn.sigmoid(reset)
+    cand = jnp.tanh(reset * cand)
+    update = jax.nn.sigmoid(update - 1)
+    deter = update * cand + (1 - update) * deter
+    out = deter
+
+    return deter, out
+
+  def _gru_8(self, deter, stoch, action):
+    kw = dict(**self.kw, norm=self.norm, act=self.act)
+    inkw = {**self.kw, 'norm': self.norm, 'binit': False}
+    stoch = stoch.reshape((stoch.shape[0], -1))
+    action /= sg(jnp.maximum(1, jnp.abs(action)))
+    g = self.blocks
+    flat2group = lambda x: einops.rearrange(x, '... (g h) -> ... g h', g=g)
+    group2flat = lambda x: einops.rearrange(x, '... g h -> ... (g h)', g=g)
+    x0 = self.get('dynin0_8', Linear, self.hidden, **kw)(deter)
+    x1 = self.get('dynin1_8', Linear, self.hidden, **kw)(stoch)
+    # print all the kw values
+    x2 = self.get('dynin2_8', Linear, self.hidden, **kw)(action) # ideally we want this to dynamically change based on the passed on action groups. 
+    x = jnp.concatenate([x0, x1, x2], -1)[..., None, :].repeat(g, -2)
+    x = group2flat(jnp.concatenate([flat2group(deter), x], -1))
+    for i in range(self.dynlayers):
+      x = self.get(
+          f'dyn{i}_8', BlockLinear, self.deter, g, **kw,
+          block_norm=self.block_norm, block_fans=self.block_fans)(x)
+    x = self.get(
+        'dyncore_8', BlockLinear, 3 * self.deter, g, **self.kw,
+        block_fans=self.block_fans)(x)
+    gates = jnp.split(flat2group(x), 3, -1)
+    reset, cand, update = [group2flat(x) for x in gates]
+    reset = jax.nn.sigmoid(reset)
+    cand = jnp.tanh(reset * cand)
+    update = jax.nn.sigmoid(update - 1)
+    deter = update * cand + (1 - update) * deter
+    out = deter
+  
+    return deter, out
+  
   def _logit(self, name, x):
     kw = dict(**self.kw, outscale=self.outscale)
     kw['binit'] = False
@@ -218,7 +433,6 @@ class RSSM(nj.Module):
 
   def _dist(self, logit):
     return tfd.Independent(jaxutils.OneHotDist(logit.astype(f32)), 1)
-
 
 class SimpleEncoder(nj.Module):
 
@@ -625,7 +839,8 @@ class Linear(nj.Module):
   def _layer(self, x):
     shape = (x.shape[-1], int(np.prod(self.units)))
     fan_shape = (self.fanin, shape[1]) if self.fanin else None
-    x = x @ self.get('kernel', self._winit, shape, fan_shape).astype(x.dtype)
+    kernel = self.get('kernel', self._winit, shape, fan_shape)
+    x = x @ kernel.astype(x.dtype)
     flops = int(np.prod(shape))
     if self.bias:
       if self.binit:

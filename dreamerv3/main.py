@@ -148,14 +148,21 @@ def make_logger(config):
   step = embodied.Counter()
   logdir = config.logdir
   multiplier = config.env.get(config.task.split('_')[0], {}).get('repeat', 1)
-  logger = embodied.Logger(step, [
-      embodied.logger.TerminalOutput(config.filter, 'Agent'),
-      embodied.logger.JSONLOutput(logdir, 'metrics.jsonl'),
-      embodied.logger.JSONLOutput(logdir, 'scores.jsonl', 'episode/score'),
-      embodied.logger.TensorBoardOutput(
-          logdir, config.run.log_video_fps, config.tensorboard_videos),
-      # embodied.logger.WandbOutput(logdir.name, ...),
-  ], multiplier)
+  loggers = [embodied.logger.TerminalOutput(config.filter, 'Agent')]
+  print("Loggers")
+  # if config.enable_wandb, then add WandBOutput to loggers
+  if config.enable_wandb:
+    loggers.append(embodied.logger.WandBOutput(logdir, config=config))
+  
+  # logger = embodied.Logger(step, [
+  #     embodied.logger.TerminalOutput(config.filter, 'Agent'),
+  #     embodied.logger.JSONLOutput(logdir, 'metrics.jsonl'),
+  #     embodied.logger.JSONLOutput(logdir, 'scores.jsonl', 'episode/score'),
+  #     embodied.logger.TensorBoardOutput(
+  #         logdir, config.run.log_video_fps, config.tensorboard_videos),
+  #     embodied.logger.WandBOutput(logdir.name, config),
+  # ], multiplier)
+  logger = embodied.Logger(step, loggers, multiplier)
   return logger
 
 

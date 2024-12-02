@@ -279,8 +279,18 @@ class WandBOutput:
 
   def __init__(self, name, pattern=r'.*', **kwargs):
     self._pattern = re.compile(pattern)
+    config = kwargs.get('config', None)
     import wandb
-    wandb.init(name=name, **kwargs)
+    # wandb.init(name=name, **kwargs)
+    wandb.init(
+			project=config.wandb_project,
+			entity=config.wandb_entity,
+			name=config.run_descriptor,
+			# group=self._group,
+			tags=[f"seed:{config.seed}"] + ["ED2"],
+			# dir=self._log_dir,
+			# config=OmegaConf.to_container(cfg, resolve=True),
+		)
     self._wandb = wandb
 
   def __call__(self, summaries):
